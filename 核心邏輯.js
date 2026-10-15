@@ -14,11 +14,19 @@ function doGet(e) {
   if (e && e.parameter && e.parameter.action) {
     return jsonResponse_(dispatchApi_(e.parameter.action, e.parameter));
   }
-  return HtmlService.createTemplateFromFile('前端架構')
-      .evaluate()
-      .setTitle('四維系統 - 智慧排班與記帳')
-      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
-      .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  try {
+    return HtmlService.createTemplateFromFile('index')
+        .evaluate()
+        .setTitle('四維系統 - 智慧排班與記帳')
+        .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+        .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  } catch (err) {
+    return HtmlService.createTemplateFromFile('前端架構')
+        .evaluate()
+        .setTitle('四維系統 - 智慧排班與記帳')
+        .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+        .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  }
 }
 
 /**
