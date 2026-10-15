@@ -1,0 +1,1192 @@
+<script>
+    var CACHE_TTL_MS = 30 * 60 * 1000;
+    var STORAGE_PREFIX = 'fourdim-month-v1:';
+    var FIXED_STORAGE_KEY = 'fourdim-fixed-v1';
+    var THEME_STORAGE_KEY = 'life_grid_theme';
+    var VIEW_STORAGE_KEY = 'life_grid_view';
+
+    var TAB_ON = 'min-h-[44px] px-3.5 sm:px-4 py-2 rounded-lg text-sm font-bold transition shadow-sm bg-amber-500 text-white dark:text-slate-900 active:scale-95';
+    var TAB_OFF = 'min-h-[44px] px-3.5 sm:px-4 py-2 rounded-lg text-sm font-bold transition text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 active:scale-95';
+
+    var EXPENSE_CATS = ['餐飲', '交通(油資)', '車輛保養'];
+    var INCOME_CATS = ['加班', '獎金'];
+    var LEGACY_CAT_MAP = {
+        '飲食': '餐飲',
+        '交通': '交通(油資)',
+        '加油': '交通(油資)',
+        '油資': '交通(油資)',
+        '保養': '車輛保養',
+        '薪資': '獎金'
+    };
+
+    // 部署到 Vercel 時可把 /exec 網址寫在這裡。頁面上的「儲存連線」會寫入 localStorage，並優先於這行。
+    var GAS_WEB_APP_URL = '';
+    var GAS_URL_STORAGE_KEY = 'fourdim-gas-web-app-url';
+    // 密鑰只存在瀏覽器 localStorage，不要寫進原始碼（專案在 GitHub 上）。
+    var GAS_KEY_STORAGE_KEY = 'fourdim-gas-api-key';
+    var GAS_ACTIONS = {
+        getCalendarMonthData: { args: ['sheetName', 'year', 'month'] },
+        getFixedSettings: { args: [] },
+        saveFixedSettings: { args: ['baseDate', 'patternText'] },
+        updateRecordFields: { args: ['sheetName', 'dateStr', 'fields'] }
+    };
+
+    var currentDate = new Date();
+    var currentSheetName = '隨機排班';
+    var scheduleDataMap = Object.create(null);
+    var memoryCache = new Map();
+    var pendingCounts = Object.create(null);
+    var fixedSettingsMemory = null;
+    var fixedSettingsFormReady = false;
+    var fixedSettingsPending = false;
+    var dataEpoch = 0;
+    var requestSerial = 0;
+    var blockClicks = false;
+    var saveInFlight = false;
+    var dom = {};
+
+    // 視圖狀態：手機預設為清單模式 (list)，電腦預設為月曆模式 (grid)
+    var currentView = (function () {
+        try {
+            var saved = localStorage.getItem(VIEW_STORAGE_KEY);
+            if (saved === 'list' || saved === 'grid') return saved;
+        } catch (e) {}
+        return (window.innerWidth < 768) ? 'list' : 'grid';
+    })();
+
+    function initApp() {
+        cacheDom();
+        updateThemeButton();
+        applyViewMode();
+
+        dom.grid.addEventListener('click', onGridClick);
+        dom.list.addEventListener('click', onGridClick);
+        dom.expenseList.addEventListener('input', updatePreview);
+        dom.expenseList.addEventListener('change', updatePreview);
+        dom.expenseList.addEventListener('click', onExpenseListClick);
+
+        initGasUrlPanel();
+        console.log('[env] ' + (isGasHosted() ? 'gas' : 'external') + ' ' + (getGasWebAppUrl() || '(no web app url)'));
+        fetchAllData(false);
+    }
+
+    // 視圖模式切換（清單模式 / 月曆模式）
+    function toggleView() {
+        currentView = (currentView === 'list') ? 'grid' : 'list';
+        try {
+            localStorage.setItem(VIEW_STORAGE_KEY, currentView);
+        } catch (e) {}
+        applyViewMode();
+        renderCalendar();
+    }
+
+    function applyViewMode() {
+        var isList = (currentView === 'list');
+        if (dom.btnViewToggle) {
+            dom.btnViewToggle.textContent = isList ? '📅 月曆模式' : '📊 清單模式';
+        }
+        if (dom.weekHeader) dom.weekHeader.classList.toggle('hidden', isList);
+        if (dom.grid) dom.grid.classList.toggle('hidden', isList);
+        if (dom.list) dom.list.classList.toggle('hidden', !isList);
+    }
+
+    // 主題切換（深色 / 淺色）
+    function toggleTheme() {
+        var isDark = document.documentElement.classList.toggle('dark');
+        try {
+            localStorage.setItem(THEME_STORAGE_KEY, isDark ? 'dark' : 'light');
+        } catch (e) {}
+        updateThemeButton();
+    }
+
+    function updateThemeButton() {
+        if (!dom.btnTheme) return;
+        dom.btnTheme.textContent = document.documentElement.classList.contains('dark') ? '☀️ 淺色' : '🌙 深色';
+    }
+
+    function isGasHosted() {
+        return !!(window.google && google.script && google.script.run);
+    }
+
+    function isAllowedGasWebAppUrl(url) {
+        try {
+            var parsed = new URL(url);
+            return parsed.protocol === 'https:'
+                && parsed.hostname === 'script.google.com'
+                && parsed.pathname.indexOf('/macros/') !== -1
+                && /\/exec\/?$/.test(parsed.pathname);
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function getGasWebAppUrl() {
+        try {
+            var stored = localStorage.getItem(GAS_URL_STORAGE_KEY);
+            if (stored && stored.trim()) return stored.trim();
+        } catch (e) {}
+        return String(GAS_WEB_APP_URL || '').trim();
+    }
+
+    function getGasApiKey() {
+        try {
+            var stored = localStorage.getItem(GAS_KEY_STORAGE_KEY);
+            return stored ? stored.trim() : '';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function saveGasWebAppUrl() {
+        var url = dom.gasUrlInput ? dom.gasUrlInput.value.trim() : '';
+        var key = dom.gasKeyInput ? dom.gasKeyInput.value.trim() : '';
+        if (!isAllowedGasWebAppUrl(url)) {
+            alert('請貼上 GAS 部署後的 https://script.google.com/macros/s/.../exec 網址');
+            return;
+        }
+        if (!key) {
+            alert('請填入 API 密鑰（在 Apps Script 執行 generateApiKey() 取得）');
+            return;
+        }
+        try {
+            localStorage.setItem(GAS_URL_STORAGE_KEY, url.replace(/\/$/, ''));
+            localStorage.setItem(GAS_KEY_STORAGE_KEY, key);
+        } catch (e) {
+            alert('瀏覽器無法儲存連線設定');
+            return;
+        }
+        memoryCache.clear();
+        storageRemoveByPrefix(STORAGE_PREFIX);
+        storageRemove(FIXED_STORAGE_KEY);
+        fixedSettingsMemory = null;
+        setGasUrlStatus('已儲存，正在重新載入班表…');
+        fetchAllData(true);
+    }
+
+    function initGasUrlPanel() {
+        if (isGasHosted() || !dom.gasUrlPanel) return;
+        dom.gasUrlPanel.classList.remove('hidden');
+        if (dom.gasUrlInput) dom.gasUrlInput.value = getGasWebAppUrl();
+        if (dom.gasKeyInput) dom.gasKeyInput.value = getGasApiKey();
+        if (!getGasWebAppUrl() || !getGasApiKey()) {
+            setGasUrlStatus('目前在 GAS 外面執行。貼上 Web App 的 /exec 網址與 API 密鑰後按「儲存連線」。');
+        }
+    }
+
+    function setGasUrlStatus(text) {
+        if (dom.gasUrlStatus) dom.gasUrlStatus.textContent = text || '';
+    }
+
+    function callServer(functionName, namedArgs) {
+        var action = GAS_ACTIONS[functionName];
+        if (!action) return Promise.reject(new Error('未知的 API：' + functionName));
+        var args = namedArgs || {};
+        var label = (isGasHosted() ? 'google.script.run ' : 'fetch ') + functionName + ' #' + requestSerial;
+        console.time(label);
+        var pending = isGasHosted()
+            ? callGasRun_(functionName, action, args)
+            : callGasFetch_(functionName, action, args);
+        return pending.then(function (result) {
+            console.timeEnd(label);
+            return result;
+        }, function (error) {
+            console.timeEnd(label);
+            throw error;
+        });
+    }
+
+    function callGasRun_(functionName, action, args) {
+        return new Promise(function (resolve, reject) {
+            var runner = google.script.run
+                .withSuccessHandler(resolve)
+                .withFailureHandler(function (error) {
+                    var message = error && error.message ? error.message : error;
+                    reject(new Error(message || 'google.script.run 失敗'));
+                });
+            var values = action.args.map(function (key) { return args[key]; });
+            runner[functionName].apply(runner, values);
+        });
+    }
+
+    function callGasFetch_(functionName, action, args) {
+        var endpoint = getGasWebAppUrl();
+        if (!endpoint) return Promise.reject(new Error('尚未設定 GAS Web App URL'));
+        var apiKey = getGasApiKey();
+        if (!apiKey) return Promise.reject(new Error('尚未設定 API 密鑰'));
+
+        var params = new URLSearchParams();
+        params.set('action', functionName);
+        params.set('key', apiKey);
+        action.args.forEach(function (key) {
+            var value = args[key];
+            if (value === undefined || value === null) return;
+            params.set(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
+        });
+        var requestUrl = endpoint + (endpoint.indexOf('?') >= 0 ? '&' : '?') + params.toString();
+
+        return fetch(requestUrl, { method: 'GET', redirect: 'follow' }).then(function (response) {
+            return response.text().then(function (text) {
+                var data;
+                try {
+                    data = JSON.parse(text);
+                } catch (e) {
+                    throw new Error('後端沒有回傳 JSON（HTTP ' + response.status + '）。請確認 Web App 已重新部署，且存取權為「任何人」。');
+                }
+                if (data && data.code === 'UNAUTHORIZED') throw new Error(data.error || 'API 密鑰驗證失敗');
+                if (!response.ok && data && data.error) throw new Error(data.error);
+                return data;
+            });
+        }, function (networkError) {
+            throw new Error('連不到 GAS（' + (networkError && networkError.message ? networkError.message : networkError) +
+                '）。常見原因：網址不是 /exec、Web App 存取權不是「任何人」、尚未重新部署新版本。');
+        });
+    }
+
+    function cacheDom() {
+        dom.title = document.getElementById('year-month-title');
+        dom.grid = document.getElementById('calendar-grid');
+        dom.list = document.getElementById('calendar-list');
+        dom.weekHeader = document.getElementById('calendar-week-header');
+        dom.btnRandom = document.getElementById('btn-random');
+        dom.btnFixed = document.getElementById('btn-fixed');
+        dom.btnViewToggle = document.getElementById('btn-view-toggle');
+        dom.btnTheme = document.getElementById('btn-theme');
+        dom.tip = document.getElementById('mode-tip');
+        dom.settings = document.getElementById('fixed-settings-panel');
+        dom.baseDate = document.getElementById('setting-base-date');
+        dom.pattern = document.getElementById('setting-pattern');
+        dom.modal = document.getElementById('edit-modal');
+        dom.modalTitle = document.getElementById('modal-date-title');
+        dom.editRow = document.getElementById('edit-row');
+        dom.shiftCustom = document.getElementById('edit-shift-custom');
+        dom.holiday = document.getElementById('edit-holiday');
+        dom.expenseList = document.getElementById('expense-list');
+        dom.memo = document.getElementById('edit-memo');
+        dom.previewD = document.getElementById('preview-d');
+        dom.previewE = document.getElementById('preview-e');
+        dom.previewF = document.getElementById('preview-f');
+        dom.saveBtn = document.getElementById('btn-save-record');
+        dom.gasUrlPanel = document.getElementById('gas-url-panel');
+        dom.gasUrlInput = document.getElementById('gas-url-input');
+        dom.gasKeyInput = document.getElementById('gas-key-input');
+        dom.gasUrlStatus = document.getElementById('gas-url-status');
+
+        dom.statEarly = document.getElementById('stat-early');
+        dom.statLate = document.getElementById('stat-late');
+        dom.statOff = document.getElementById('stat-off');
+        dom.statIncome = document.getElementById('stat-income');
+        dom.statExpense = document.getElementById('stat-expense');
+        dom.statBalance = document.getElementById('stat-balance');
+    }
+
+    function switchMode(sheetName) {
+        if (sheetName === currentSheetName) return;
+        currentSheetName = sheetName;
+
+        if (sheetName === '隨機排班') {
+            dom.btnRandom.className = TAB_ON;
+            dom.btnFixed.className = TAB_OFF;
+            dom.tip.textContent = '💡 提示：目前檢視【隨機排班】，點擊任一日即可修改班別、節日、收支明細與備註！';
+            dom.settings.classList.add('hidden');
+            fixedSettingsFormReady = false;
+        } else {
+            dom.btnFixed.className = TAB_ON;
+            dom.btnRandom.className = TAB_OFF;
+            dom.tip.textContent = '💡 提示：目前檢視【固定輪班】，可透過上方面板設定起始日與循環週期；點擊格子也能個別修改班別與收支！';
+            dom.settings.classList.remove('hidden');
+        }
+
+        fetchAllData(false);
+    }
+
+    function changeMonth(direction) {
+        currentDate.setMonth(currentDate.getMonth() + direction);
+        fetchAllData(false);
+    }
+
+    function goToToday() {
+        currentDate = new Date();
+        fetchAllData(false);
+    }
+
+    function currentCacheKey() {
+        return makeCacheKey(currentSheetName, currentDate.getFullYear(), currentDate.getMonth());
+    }
+
+    function makeCacheKey(sheetName, year, month) {
+        return sheetName + '|' + year + '|' + month;
+    }
+
+    function fetchAllData(force) {
+        var year = currentDate.getFullYear();
+        var month = currentDate.getMonth();
+        var key = makeCacheKey(currentSheetName, year, month);
+        var trace = 'fetchAllData #' + (++requestSerial) + ' ' + key;
+        console.time(trace);
+
+        if (!force) {
+            var cached = readMonthCache(key);
+            if (cached) {
+                showCachedMonth(cached);
+                console.timeEnd(trace);
+                return;
+            }
+            console.log('[cache] miss ' + key);
+            showMonthShell();
+            if (pendingCount(key) > 0) {
+                console.log('[request] skip duplicate ' + key);
+                console.timeEnd(trace);
+                return;
+            }
+        }
+
+        requestMonth(key, year, month, trace);
+    }
+
+    function requestMonth(key, year, month, trace) {
+        var epochAtStart = dataEpoch;
+        var sheetName = currentSheetName;
+        addPending(key);
+
+        callServer('getCalendarMonthData', {
+            sheetName: sheetName,
+            year: year,
+            month: month
+        }).then(function (payload) {
+            console.timeEnd(trace);
+            var painted = false;
+            try {
+                painted = handleMonthPayload(key, epochAtStart, payload) === true;
+            } finally {
+                finishMonthRequest(key, painted);
+            }
+        }).catch(function (error) {
+            console.timeEnd(trace);
+            finishMonthRequest(key, false);
+            console.error('載入失敗', error);
+            if (!isGasHosted()) setGasUrlStatus(error && error.message ? error.message : '載入失敗');
+        });
+    }
+
+    function finishMonthRequest(key, painted) {
+        removePending(key);
+        if (painted || pendingCount(currentCacheKey()) === 0) setGridBusy(false);
+    }
+
+    function handleMonthPayload(key, epochAtStart, payload) {
+        if (epochAtStart !== dataEpoch) {
+            console.log('[request] discard stale ' + key);
+            return false;
+        }
+
+        var normalized = normalizeMonthPayload(payload);
+        if (!normalized) return false;
+        if (normalized.timings) {
+            console.log('[server timings] getCalendarMonthData ' + key, normalized.timings);
+        }
+
+        writeMonthCache(key, {
+            records: normalized.records,
+            fixedSettings: normalized.fixedSettings
+        });
+
+        if (currentCacheKey() !== key) {
+            console.log('[request] cached offscreen ' + key);
+            return false;
+        }
+
+        acceptFixedSettings(normalized.fixedSettings, currentSheetName === '固定輪班' && !fixedSettingsFormReady);
+        if (currentSheetName === '固定輪班' && !fixedSettingsFormReady) {
+            ensureFixedSettings();
+        }
+        paintRecords(normalized.records);
+        return true;
+    }
+
+    function normalizeMonthPayload(payload) {
+        if (Array.isArray(payload)) {
+            return { records: payload, timings: null, fixedSettings: null };
+        }
+        if (!payload || payload.error || !Array.isArray(payload.records)) {
+            console.error('載入失敗', payload && payload.error ? payload.error : payload);
+            return null;
+        }
+        return {
+            records: payload.records,
+            timings: payload.timings || null,
+            fixedSettings: payload.fixedSettings || null
+        };
+    }
+
+    function showCachedMonth(entry) {
+        acceptFixedSettings(entry.fixedSettings, currentSheetName === '固定輪班' && !fixedSettingsFormReady);
+        if (currentSheetName === '固定輪班' && !fixedSettingsFormReady) ensureFixedSettings();
+        paintRecords(entry.records || []);
+        setGridBusy(false);
+    }
+
+    function showMonthShell() {
+        scheduleDataMap = Object.create(null);
+        setGridBusy(true);
+        renderCalendar();
+    }
+
+    function paintRecords(records) {
+        var map = Object.create(null);
+        var list = records || [];
+        for (var i = 0; i < list.length; i++) {
+            var item = list[i];
+            if (item && item.date) map[item.date] = item;
+        }
+        scheduleDataMap = map;
+        renderCalendar();
+    }
+
+    function ensureFixedSettings() {
+        if (currentSheetName !== '固定輪班' || fixedSettingsFormReady) return;
+        var stored = fixedSettingsMemory || readFixedSettingsCache();
+        if (stored) {
+            acceptFixedSettings(stored, true);
+            fixedSettingsFormReady = true;
+            return;
+        }
+        requestFixedSettings();
+    }
+
+    function requestFixedSettings() {
+        if (fixedSettingsPending) {
+            console.log('[request] skip duplicate getFixedSettings');
+            return;
+        }
+
+        fixedSettingsPending = true;
+        callServer('getFixedSettings', {}).then(function (res) {
+            fixedSettingsPending = false;
+            if (!res || !res.success) {
+                console.error('讀取循環設定失敗', res && res.error);
+                return;
+            }
+            if (res.timings) console.log('[server timings] getFixedSettings', res.timings);
+            if (currentSheetName !== '固定輪班') {
+                rememberFixedSettings(res);
+                return;
+            }
+            acceptFixedSettings(res, true);
+            fixedSettingsFormReady = true;
+        }).catch(function (error) {
+            fixedSettingsPending = false;
+            console.error('讀取循環設定失敗', error);
+        });
+    }
+
+    function saveFixedConfig() {
+        var baseDate = dom.baseDate.value;
+        var patternText = dom.pattern.value;
+        if (!baseDate || !patternText) {
+            alert('起始日與循環週期不能為空！');
+            return;
+        }
+
+        callServer('saveFixedSettings', {
+            baseDate: baseDate,
+            patternText: patternText
+        }).then(function (res) {
+            if (!res || !res.success) {
+                alert('儲存失敗：' + (res && res.error ? res.error : '未知錯誤'));
+                return;
+            }
+            if (res.timings) console.log('[server timings] saveFixedSettings', res.timings);
+            alert('循環週期設定儲存成功！');
+            rememberFixedSettings({ baseDate: baseDate, patternText: patternText });
+            fixedSettingsFormReady = true;
+            invalidateSheetCache('固定輪班');
+            dataEpoch++;
+            showMonthShell();
+            fetchAllData(true);
+        }).catch(function (error) {
+            alert('儲存失敗：' + (error && error.message ? error.message : error));
+        });
+    }
+
+    function saveRecordData() {
+        if (saveInFlight) return;
+
+        var composed = composeFields();
+        var dateStr = dom.editRow.value;
+        var sheetName = currentSheetName;
+        var key = currentCacheKey();
+        var fields = {
+            shift: composed.shift,
+            category: composed.category,
+            amount: composed.amount,
+            memo: composed.memo
+        };
+
+        saveInFlight = true;
+        setSaveBusy(true);
+        callServer('updateRecordFields', {
+            sheetName: sheetName,
+            dateStr: dateStr,
+            fields: fields
+        }).then(function (res) {
+            saveInFlight = false;
+            setSaveBusy(false);
+            if (!res || !res.success) {
+                alert('儲存失敗：' + (res && res.error ? res.error : '未知錯誤'));
+                return;
+            }
+            if (res.timings) console.log('[server timings] updateRecordFields', res.timings);
+            closeModal();
+            dataEpoch++;
+            var patch = {
+                shift: composed.shift,
+                category: composed.category,
+                amount: composed.amount,
+                memo: composed.memo,
+                holiday: composed.holiday
+            };
+            patchCachedRecord(key, dateStr, patch, sheetName);
+            if (currentCacheKey() === key) patchVisibleRecord(dateStr, patch, sheetName);
+            fetchAllData(true);
+        }).catch(function (error) {
+            saveInFlight = false;
+            setSaveBusy(false);
+            alert('儲存失敗：' + (error && error.message ? error.message : error));
+        });
+    }
+
+    function patchVisibleRecord(dateStr, fields, sheetName) {
+        var prev = scheduleDataMap[dateStr] || {
+            date: dateStr,
+            weekDay: '',
+            shift: '',
+            category: '',
+            amount: 0,
+            memo: '',
+            holiday: '',
+            row: null
+        };
+        scheduleDataMap[dateStr] = {
+            row: prev.row || null,
+            date: dateStr,
+            weekDay: prev.weekDay || '',
+            shift: fields.shift,
+            category: fields.category,
+            amount: fields.amount,
+            memo: fields.memo,
+            holiday: fields.holiday || ''
+        };
+        renderCalendar();
+    }
+
+    function patchCachedRecord(key, dateStr, fields, sheetName) {
+        var cached = readMonthCache(key, true);
+        if (!cached || !Array.isArray(cached.records)) return;
+        var records = [];
+        for (var i = 0; i < cached.records.length; i++) {
+            var item = cached.records[i];
+            if (!item || item.date !== dateStr) {
+                records.push(item);
+                continue;
+            }
+            records.push({
+                row: item.row,
+                date: item.date,
+                weekDay: item.weekDay,
+                shift: fields.shift,
+                category: fields.category,
+                amount: fields.amount,
+                memo: fields.memo,
+                holiday: fields.holiday || ''
+            });
+        }
+        writeMonthCache(key, {
+            records: records,
+            fixedSettings: cached.fixedSettings || null
+        });
+    }
+
+    var FILLER_CELL_CLASS = 'bg-slate-100 dark:bg-[#172033] min-h-[6.5rem] sm:min-h-[8rem] p-1.5 sm:p-2 text-slate-400 dark:text-slate-600 select-none border-r border-b border-slate-200 dark:border-slate-700 text-[11px] sm:text-xs';
+
+    // 核心渲染：同步渲染月曆網格視圖與直式清單視圖
+    function renderCalendar() {
+        console.time('renderCalendar');
+        var year = currentDate.getFullYear();
+        var month = currentDate.getMonth();
+        dom.title.textContent = year + ' 年 ' + (month + 1) + ' 月';
+
+        var firstDayIndex = new Date(year, month, 1).getDay();
+        var totalDays = new Date(year, month + 1, 0).getDate();
+        var prevTotalDays = new Date(year, month, 0).getDate();
+        var todayStr = formatLocalDate(new Date());
+
+        // 1. 渲染網格視圖 (Grid View)
+        var gridCells = [];
+        // 前置空白天數
+        for (var i = firstDayIndex - 1; i >= 0; i--) {
+            gridCells.push('<div class="' + FILLER_CELL_CLASS + '">' + (prevTotalDays - i) + '</div>');
+        }
+        // 當月正確天數 (確保從 1 到 totalDays 嚴格遞增)
+        for (var day = 1; day <= totalDays; day++) {
+            gridCells.push(buildDayCell(year, month, day, todayStr));
+        }
+        // 後置空白天數
+        var totalCellsPrinted = firstDayIndex + totalDays;
+        var remainingCells = totalCellsPrinted <= 35 ? 35 - totalCellsPrinted : 42 - totalCellsPrinted;
+        for (var nextDay = 1; nextDay <= remainingCells; nextDay++) {
+            gridCells.push('<div class="' + FILLER_CELL_CLASS + '">' + nextDay + '</div>');
+        }
+        dom.grid.innerHTML = gridCells.join('');
+
+        // 2. 渲染直式清單視圖 (List View - 專為手機優化)
+        var listRows = [];
+        for (var d = 1; d <= totalDays; d++) {
+            listRows.push(buildListRow(year, month, d, todayStr));
+        }
+        dom.list.innerHTML = listRows.join('');
+
+        // 3. 更新即時統計
+        updateStats(year, month);
+        console.timeEnd('renderCalendar');
+    }
+
+    // 建立單個月曆網格格子 (改為垂直流式佈局，徹底解決班別與日期遮擋問題)
+    function buildDayCell(year, month, day, todayStr) {
+        var dayNum = Number(day);
+        var monthStr = (month + 1 < 10 ? '0' : '') + (month + 1);
+        var dayStr = (dayNum < 10 ? '0' : '') + dayNum;
+        var dateKey = year + '-' + monthStr + '-' + dayStr;
+
+        var record = scheduleDataMap[dateKey] || {};
+        var shift = record.shift || '';
+        var category = record.category || '';
+        var amount = Number(record.amount) || 0;
+        var parsedMemo = parseMemoField(record.memo);
+        var holiday = record.holiday || parsedMemo.holiday || '';
+        var memoText = String(record.memo || '').replace(/^\[[^\]]*\]\s*/, '');
+
+        var isToday = (dateKey === todayStr);
+        var boxStyle = isToday
+            ? 'bg-amber-50 dark:bg-amber-500/10 ring-2 ring-inset ring-amber-500 z-10'
+            : 'bg-white dark:bg-[#1e293b] hover:bg-slate-50 dark:hover:bg-slate-700/60';
+
+        var dayNumClass = isToday
+            ? 'bg-amber-500 text-white dark:text-slate-900 rounded-full w-5 h-5 flex items-center justify-center text-[10px]'
+            : (holiday ? 'text-rose-600 dark:text-rose-400 font-black' : 'text-slate-700 dark:text-slate-200');
+
+        var holidayTag = holiday
+            ? '<span class="px-1 py-0.5 rounded text-[9px] sm:text-[10px] font-bold bg-rose-100 text-rose-700 dark:bg-rose-500/20 dark:text-rose-300 truncate max-w-[48px] sm:max-w-none text-right">' + escapeHtml(holiday) + '</span>'
+            : '';
+
+        var amountHtml = '';
+        if (amount !== 0) {
+            amountHtml = '<div class="text-[11px] sm:text-[12px] font-black leading-tight ' + (amount < 0 ? 'text-rose-500 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400') + '">' +
+                (amount < 0 ? '-$' : '+$') + Math.abs(amount) + '</div>';
+        }
+
+        return '<div class="' + boxStyle + ' min-h-[6.5rem] sm:min-h-[8rem] p-1.5 sm:p-2 flex flex-col justify-between transition cursor-pointer border-r border-b border-slate-200 dark:border-slate-700 overflow-hidden select-none active:scale-[0.98]" data-date="' + dateKey + '">' +
+            '<!-- 第一行：左邊日期數字，右邊國定假日標籤 -->' +
+            '<div class="flex items-center justify-between gap-1 w-full min-h-[22px]">' +
+                '<span class="text-xs sm:text-sm font-black ' + dayNumClass + '">' + dayNum + '</span>' +
+                holidayTag +
+            '</div>' +
+
+            '<!-- 第二行：班別徽章（日期正下方，置中/橫向顯示，絕不遮擋日期） -->' +
+            '<div class="w-full my-0.5">' +
+                buildShiftBadge(shift, 'grid') +
+            '</div>' +
+
+            '<!-- 第三行：收支類別、金額與備註 -->' +
+            '<div class="space-y-0.5 overflow-hidden w-full mt-auto pt-0.5">' +
+                amountHtml +
+                (category ? '<div class="text-[9px] sm:text-[10px] text-amber-700 dark:text-amber-300 font-semibold truncate">📌 ' + escapeHtml(category) + '</div>' : '') +
+                (memoText ? '<div class="text-[9px] text-slate-500 dark:text-slate-400 truncate">💬 ' + escapeHtml(memoText) + '</div>' : '') +
+            '</div>' +
+        '</div>';
+    }
+
+    // 建立單個手機直式清單列 (List View Row)
+    function buildListRow(year, month, day, todayStr) {
+        var dayNum = Number(day);
+        var curDate = new Date(year, month, dayNum);
+        var weekDays = ['週日', '週一', '週二', '週三', '週四', '週五', '週六'];
+        var weekDayStr = weekDays[curDate.getDay()];
+
+        var monthStr = (month + 1 < 10 ? '0' : '') + (month + 1);
+        var dayStr = (dayNum < 10 ? '0' : '') + dayNum;
+        var dateKey = year + '-' + monthStr + '-' + dayStr;
+
+        var record = scheduleDataMap[dateKey] || {};
+        var shift = record.shift || '';
+        var category = record.category || '';
+        var amount = Number(record.amount) || 0;
+        var parsedMemo = parseMemoField(record.memo);
+        var holiday = record.holiday || parsedMemo.holiday || '';
+        var memoText = String(record.memo || '').replace(/^\[[^\]]*\]\s*/, '');
+
+        var isToday = (dateKey === todayStr);
+        var isSunday = (curDate.getDay() === 0);
+        var isSaturday = (curDate.getDay() === 6);
+
+        var dateColorClass = isSunday ? 'text-rose-600 dark:text-rose-400' : (isSaturday ? 'text-sky-600 dark:text-sky-400' : 'text-slate-800 dark:text-slate-100');
+        var weekColorClass = isSunday ? 'text-rose-500 dark:text-rose-400 font-bold' : (isSaturday ? 'text-sky-500 dark:text-sky-400 font-bold' : 'text-slate-500 dark:text-slate-400');
+
+        var rowClass = isToday
+            ? 'bg-amber-50/80 dark:bg-amber-500/10 ring-2 ring-amber-500'
+            : 'bg-white dark:bg-[#1e293b] hover:bg-slate-50 dark:hover:bg-slate-700/50';
+
+        var holidayTag = holiday
+            ? '<span class="px-2 py-0.5 rounded-lg text-xs font-bold bg-rose-100 text-rose-700 dark:bg-rose-500/20 dark:text-rose-300">' + escapeHtml(holiday) + '</span>'
+            : '';
+
+        var todayBadge = isToday
+            ? '<span class="px-2 py-0.5 rounded-lg text-xs font-black bg-amber-500 text-white dark:text-slate-900">今日</span>'
+            : '';
+
+        var amountHtml = '';
+        if (amount !== 0) {
+            amountHtml = '<div class="text-base sm:text-lg font-black ' + (amount < 0 ? 'text-rose-500 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400') + '">' +
+                (amount < 0 ? '-$' : '+$') + Math.abs(amount) + '</div>';
+        }
+
+        return '<div class="' + rowClass + ' min-h-[58px] p-3 sm:p-4 rounded-2xl border border-slate-200 dark:border-slate-700 transition cursor-pointer select-none active:scale-[0.99] flex flex-col sm:flex-row sm:items-center justify-between gap-2 shadow-sm" data-date="' + dateKey + '">' +
+            '<!-- 左側：日期、星期與節日標籤 -->' +
+            '<div class="flex items-center gap-2.5 flex-wrap">' +
+                '<span class="text-base sm:text-lg font-black ' + dateColorClass + '">' + monthStr + '/' + dayStr + '</span>' +
+                '<span class="text-sm font-bold ' + weekColorClass + '">' + weekDayStr + '</span>' +
+                todayBadge +
+                holidayTag +
+            '</div>' +
+
+            '<!-- 中間與右側：班別徽章、金額與備註明細 -->' +
+            '<div class="flex items-center justify-between sm:justify-end gap-3 flex-wrap sm:flex-nowrap">' +
+                '<div class="flex items-center">' +
+                    buildShiftBadge(shift, 'list') +
+                '</div>' +
+                '<div class="flex flex-col items-end text-right min-w-[90px]">' +
+                    amountHtml +
+                    (category ? '<div class="text-xs text-amber-700 dark:text-amber-300 font-semibold truncate max-w-[200px]">📌 ' + escapeHtml(category) + '</div>' : '') +
+                    (memoText ? '<div class="text-xs text-slate-500 dark:text-slate-400 truncate max-w-[220px]">💬 ' + escapeHtml(memoText) + '</div>' : '') +
+                '</div>' +
+            '</div>' +
+        '</div>';
+    }
+
+    // 建立醒目的班別徽章 (支援月曆格子橫向置中模式與清單放大模式)
+    function buildShiftBadge(shift, mode) {
+        if (!shift) return '';
+        var color = 'bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-600';
+        if (shift.indexOf('早') !== -1) {
+            color = 'bg-sky-100 text-sky-800 dark:bg-sky-900/50 dark:text-sky-300 border border-sky-300 dark:border-sky-700';
+        } else if (shift.indexOf('晚') !== -1) {
+            color = 'bg-indigo-100 text-indigo-800 dark:bg-indigo-900/50 dark:text-indigo-300 border border-indigo-300 dark:border-indigo-700';
+        } else if (shift.indexOf('休') !== -1) {
+            color = 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-700';
+        }
+
+        if (mode === 'list') {
+            return '<span class="px-3 py-1 text-xs sm:text-sm font-extrabold rounded-xl shadow-xs ' + color + ' whitespace-nowrap">' + escapeHtml(shift) + '</span>';
+        }
+
+        // 月曆格子模式 (grid)：置於日期下方橫向置中完整顯示，大字清晰，絕對不遮擋日期
+        return '<span class="w-full text-center px-1 py-0.5 sm:py-1 text-[11px] sm:text-xs font-black rounded-lg ' + color + ' block truncate shadow-xs">' + escapeHtml(shift) + '</span>';
+    }
+
+    // 當月即時統計計算
+    function updateStats(year, month) {
+        var prefix = year + '-' + String(month + 1).padStart(2, '0') + '-';
+        var early = 0, late = 0, off = 0, income = 0, expense = 0;
+        Object.keys(scheduleDataMap).forEach(function (dateKey) {
+            if (dateKey.indexOf(prefix) !== 0) return;
+            var rec = scheduleDataMap[dateKey] || {};
+            var shift = rec.shift || '';
+            if (shift.indexOf('早') !== -1) early++;
+            else if (shift.indexOf('晚') !== -1) late++;
+            else if (shift.indexOf('休') !== -1) off++;
+            var amount = Number(rec.amount) || 0;
+            if (amount > 0) income += amount;
+            else if (amount < 0) expense += -amount;
+        });
+        var balance = income - expense;
+        if (!dom.statEarly) return;
+        dom.statEarly.textContent = early;
+        dom.statLate.textContent = late;
+        dom.statOff.textContent = off;
+        dom.statIncome.textContent = '+$' + income;
+        dom.statExpense.textContent = '-$' + expense;
+        dom.statBalance.textContent = (balance < 0 ? '-$' : '$') + Math.abs(balance);
+    }
+
+    // 點擊任一網格或清單列時打開 Modal
+    function onGridClick(event) {
+        if (blockClicks) return;
+        var cell = event.target.closest ? event.target.closest('[data-date]') : null;
+        if (!cell) return;
+        var dateKey = cell.getAttribute('data-date');
+        if (!dateKey) return;
+        var record = scheduleDataMap[dateKey] || {};
+        openEditModal(dateKey, record);
+    }
+
+    /**
+     * F 欄格式：[節日] 細項1(-100)、細項2(-350) | 一般備註
+     * 解析出節日、多筆明細與一般備註。
+     */
+    function parseMemoField(memo) {
+        var text = String(memo || '').trim();
+        var result = { holiday: '', items: [], memoText: '' };
+        var m = text.match(/^\[([^\]]*)\]\s*/);
+        if (m) {
+            result.holiday = m[1];
+            text = text.slice(m[0].length);
+        }
+        if (!text) return result;
+
+        var sep = text.indexOf(' | ');
+        var itemsPart = (sep >= 0) ? text.slice(0, sep) : text;
+        var tail = (sep >= 0) ? text.slice(sep + 3).trim() : '';
+        var segments = itemsPart.split('、');
+        var items = [];
+        var allItems = true;
+        for (var i = 0; i < segments.length; i++) {
+            var im = segments[i].trim().match(/^(.*)\((-?\d+(?:\.\d+)?)\)$/);
+            if (!im) {
+                allItems = false;
+                break;
+            }
+            items.push({ note: im[1].trim(), amt: Number(im[2]) });
+        }
+        if (allItems) {
+            result.items = items;
+            result.memoText = tail;
+        } else {
+            result.memoText = text;
+        }
+        return result;
+    }
+
+    function mapCategoryName(cat, amt) {
+        if (EXPENSE_CATS.indexOf(cat) !== -1 || INCOME_CATS.indexOf(cat) !== -1) return cat;
+        if (LEGACY_CAT_MAP[cat]) return LEGACY_CAT_MAP[cat];
+        return amt > 0 ? '獎金' : '餐飲';
+    }
+
+    // 打開編輯視窗
+    function openEditModal(dateStr, record) {
+        record = record || {};
+        dom.modalTitle.textContent = '編輯日期：' + dateStr;
+        dom.editRow.value = dateStr;
+
+        var shift = (record.shift === 'null') ? '' : (record.shift || '');
+        dom.shiftCustom.value = shift;
+        highlightShift();
+
+        var parsed = parseMemoField(record.memo);
+        dom.holiday.value = String(record.holiday || parsed.holiday || '').slice(0, 6);
+        dom.memo.value = parsed.memoText;
+
+        dom.expenseList.innerHTML = '';
+        var amount = Number(record.amount) || 0;
+        var cats = String(record.category === 'null' ? '' : (record.category || ''))
+            .split(/[、,，]/)
+            .map(function (c) { return c.trim(); })
+            .filter(function (c) { return c !== ''; });
+
+        if (parsed.items.length > 0) {
+            parsed.items.forEach(function (item, idx) {
+                var rawCat = (cats.length === parsed.items.length)
+                    ? cats[idx]
+                    : (cats.length ? cats[Math.min(idx, cats.length - 1)] : '');
+                appendExpenseRow(mapCategoryName(rawCat, item.amt), Math.abs(item.amt), item.note);
+            });
+        } else if (cats.length > 0) {
+            cats.forEach(function (rawCat, idx) {
+                var amt = (idx === 0) ? amount : 0;
+                appendExpenseRow(mapCategoryName(rawCat, amt), Math.abs(amt), '');
+            });
+        } else if (amount !== 0) {
+            appendExpenseRow(mapCategoryName('', amount), Math.abs(amount), '');
+        }
+
+        updatePreview();
+        dom.modal.classList.remove('hidden');
+    }
+
+    function pickShift(value) {
+        dom.shiftCustom.value = value;
+        highlightShift();
+    }
+
+    function onShiftCustomInput() {
+        highlightShift();
+    }
+
+    function highlightShift() {
+        var current = dom.shiftCustom.value.trim();
+        var buttons = document.querySelectorAll('.shift-btn');
+        for (var i = 0; i < buttons.length; i++) {
+            var active = (buttons[i].getAttribute('data-shift') === current && current !== '');
+            buttons[i].classList.toggle('ring-4', active);
+            buttons[i].classList.toggle('ring-amber-500', active);
+            buttons[i].classList.toggle('scale-105', active);
+        }
+    }
+
+    // 新增一列收支明細
+    function appendExpenseRow(cat, amt, note) {
+        var inputClass = 'border border-slate-300 dark:border-slate-600 bg-white dark:bg-[#0f172a] text-slate-800 dark:text-slate-100 rounded-xl p-2.5 text-base md:text-sm focus:ring-2 focus:ring-amber-500 focus:outline-none min-h-[44px]';
+        var row = document.createElement('div');
+        row.className = 'expense-row flex flex-wrap sm:flex-nowrap gap-2 items-center bg-slate-50 dark:bg-[#0f172a] p-2 rounded-xl border border-slate-200 dark:border-slate-700';
+        row.innerHTML =
+            '<select class="exp-cat ' + inputClass + ' w-full sm:w-36 shrink-0">' +
+                '<optgroup label="支出">' +
+                    EXPENSE_CATS.map(function (c) { return '<option value="' + c + '">' + c + '</option>'; }).join('') +
+                '</optgroup>' +
+                '<optgroup label="收入">' +
+                    INCOME_CATS.map(function (c) { return '<option value="' + c + '">' + c + '</option>'; }).join('') +
+                '</optgroup>' +
+            '</select>' +
+            '<input type="number" min="0" step="any" class="exp-amt ' + inputClass + ' w-[48%] sm:w-28 shrink-0" placeholder="金額">' +
+            '<input type="text" class="exp-note ' + inputClass + ' flex-1 min-w-[120px]" placeholder="細項（如 便當）">' +
+            '<button type="button" class="exp-del min-w-[44px] min-h-[44px] text-rose-500 hover:text-rose-700 text-lg font-bold flex items-center justify-center rounded-xl hover:bg-rose-100 dark:hover:bg-rose-900/30 active:scale-90 transition" aria-label="刪除這筆">✕</button>';
+
+        row.querySelector('.exp-cat').value = cat || EXPENSE_CATS[0];
+        row.querySelector('.exp-amt').value = amt ? amt : '';
+        row.querySelector('.exp-note').value = note || '';
+        dom.expenseList.appendChild(row);
+    }
+
+    function addExpenseRow() {
+        appendExpenseRow(EXPENSE_CATS[0], '', '');
+        updatePreview();
+    }
+
+    function onExpenseListClick(event) {
+        var target = event.target;
+        if (!target) return;
+        var delBtn = target.closest('.exp-del');
+        if (!delBtn) return;
+        var row = delBtn.closest('.expense-row');
+        if (row) row.remove();
+        updatePreview();
+    }
+
+    function sanitizeNote(text) {
+        return String(text || '').replace(/[()（）|]/g, '').replace(/、/g, ',').trim();
+    }
+
+    function readExpenseRows() {
+        var rows = [];
+        var nodes = dom.expenseList.querySelectorAll('.expense-row');
+        for (var i = 0; i < nodes.length; i++) {
+            var cat = nodes[i].querySelector('.exp-cat').value;
+            var raw = Math.abs(Number(nodes[i].querySelector('.exp-amt').value) || 0);
+            var note = sanitizeNote(nodes[i].querySelector('.exp-note').value);
+            if (raw === 0 && !note) continue;
+            var sign = (EXPENSE_CATS.indexOf(cat) !== -1) ? -1 : 1;
+            rows.push({ cat: cat, amt: sign * raw, note: note });
+        }
+        return rows;
+    }
+
+    function composeFields() {
+        var rows = readExpenseRows();
+        var holiday = (dom.holiday.value || '').trim().slice(0, 6);
+        var total = 0;
+        rows.forEach(function (r) { total += r.amt; });
+        var category = rows.map(function (r) { return r.cat; }).join('、');
+        var itemsText = rows.map(function (r) { return r.note + '(' + r.amt + ')'; }).join('、');
+        var memoText = (dom.memo.value || '').trim();
+        var body = itemsText && memoText ? itemsText + ' | ' + memoText : (itemsText || memoText);
+        var memo = ((holiday ? '[' + holiday + '] ' : '') + body).trim();
+        return {
+            shift: dom.shiftCustom.value.trim(),
+            holiday: holiday,
+            category: category,
+            amount: Number(total) || 0,
+            memo: memo
+        };
+    }
+
+    function updatePreview() {
+        var composed = composeFields();
+        dom.previewD.textContent = composed.category || '(空)';
+        dom.previewE.textContent = String(composed.amount);
+        dom.previewF.textContent = composed.memo || '(空)';
+    }
+
+    function closeModal() {
+        dom.modal.classList.add('hidden');
+    }
+
+    function setSaveBusy(busy) {
+        if (!dom.saveBtn) return;
+        dom.saveBtn.disabled = busy;
+        dom.saveBtn.textContent = busy ? '儲存中...' : '儲存回寫';
+    }
+
+    function setGridBusy(busy) {
+        blockClicks = busy;
+        if (dom.grid) dom.grid.classList.toggle('opacity-50', busy);
+        if (dom.list) dom.list.classList.toggle('opacity-50', busy);
+    }
+
+    function acceptFixedSettings(settings, fillForm) {
+        if (!settings || !settings.baseDate) return;
+        rememberFixedSettings(settings);
+        if (!fillForm) return;
+        dom.baseDate.value = settings.baseDate || '';
+        dom.pattern.value = settings.patternText || '';
+        fixedSettingsFormReady = true;
+    }
+
+    function rememberFixedSettings(settings) {
+        if (!settings || !settings.baseDate) return;
+        fixedSettingsMemory = {
+            success: true,
+            baseDate: settings.baseDate,
+            patternText: settings.patternText || ''
+        };
+        storageSet(FIXED_STORAGE_KEY, JSON.stringify({
+            savedAt: Date.now(),
+            settings: fixedSettingsMemory
+        }));
+    }
+
+    function readFixedSettingsCache() {
+        if (fixedSettingsMemory && fixedSettingsMemory.baseDate) return fixedSettingsMemory;
+        var raw = storageGet(FIXED_STORAGE_KEY);
+        if (!raw) return null;
+        try {
+            var parsed = JSON.parse(raw);
+            if (!isFresh(parsed) || !parsed.settings) {
+                storageRemove(FIXED_STORAGE_KEY);
+                return null;
+            }
+            fixedSettingsMemory = parsed.settings;
+            return fixedSettingsMemory;
+        } catch (e) {
+            storageRemove(FIXED_STORAGE_KEY);
+            return null;
+        }
+    }
+
+    function readMonthCache(key, silent) {
+        var label = 'cacheLookup ' + key;
+        console.time(label);
+        try {
+            var memoryEntry = memoryCache.get(key);
+            if (isFresh(memoryEntry)) {
+                if (!silent) console.log('[cache] memory hit ' + key);
+                return memoryEntry;
+            }
+            if (memoryEntry) memoryCache.delete(key);
+
+            var raw = storageGet(STORAGE_PREFIX + key);
+            if (!raw) return null;
+            try {
+                var parsed = JSON.parse(raw);
+                if (!isFresh(parsed)) {
+                    storageRemove(STORAGE_PREFIX + key);
+                    return null;
+                }
+                memoryCache.set(key, parsed);
+                if (!silent) console.log('[cache] sessionStorage hit ' + key);
+                return parsed;
+            } catch (e) {
+                storageRemove(STORAGE_PREFIX + key);
+                return null;
+            }
+        } finally {
+            console.timeEnd(label);
+        }
+    }
+
+    function writeMonthCache(key, entry) {
+        var stored = {
+            savedAt: Date.now(),
+            records: entry.records || [],
+            fixedSettings: entry.fixedSettings || null
+        };
+        memoryCache.set(key, stored);
+        storageSet(STORAGE_PREFIX + key, JSON.stringify(stored));
+    }
+
+    function invalidateSheetCache(sheetName) {
+        var prefix = sheetName + '|';
+        Array.from(memoryCache.keys()).forEach(function (key) {
+            if (key.indexOf(prefix) === 0) memoryCache.delete(key);
+        });
+        storageRemoveByPrefix(STORAGE_PREFIX + prefix);
+    }
+
+    function isFresh(entry) {
+        return !!(entry && entry.savedAt && (Date.now() - entry.savedAt) < CACHE_TTL_MS);
+    }
+
+    function pendingCount(key) {
+        return pendingCounts[key] || 0;
+    }
+
+    function addPending(key) {
+        pendingCounts[key] = pendingCount(key) + 1;
+    }
+
+    function removePending(key) {
+        var next = pendingCount(key) - 1;
+        if (next <= 0) delete pendingCounts[key];
+        else pendingCounts[key] = next;
+    }
+
+    function storageGet(key) {
+        try {
+            return sessionStorage.getItem(key);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function storageSet(key, value) {
+        try {
+            sessionStorage.setItem(key, value);
+        } catch (e) {
+            console.warn('[cache] sessionStorage 寫入失敗', e);
+        }
+    }
+
+    function storageRemove(key) {
+        try {
+            sessionStorage.removeItem(key);
+        } catch (e) {}
+    }
+
+    function storageRemoveByPrefix(prefix) {
+        try {
+            var keys = [];
+            for (var i = 0; i < sessionStorage.length; i++) {
+                var storageKey = sessionStorage.key(i);
+                if (storageKey && storageKey.indexOf(prefix) === 0) keys.push(storageKey);
+            }
+            keys.forEach(function (storageKey) {
+                sessionStorage.removeItem(storageKey);
+            });
+        } catch (e) {}
+    }
+
+    function formatLocalDate(date) {
+        var year = date.getFullYear();
+        var month = String(date.getMonth() + 1).padStart(2, '0');
+        var day = String(date.getDate()).padStart(2, '0');
+        return year + '-' + month + '-' + day;
+    }
+
+    function escapeHtml(value) {
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    initApp();
+</script>
